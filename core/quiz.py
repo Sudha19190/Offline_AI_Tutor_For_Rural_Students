@@ -6,7 +6,7 @@ import random
 import uuid
 
 import ollama
-from pydantic import BaseModel, ValidationError, field_validator
+from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
 from core.config import COLLECTION, DEFAULT_CLASS_LEVEL, LLM_MODEL, LLM_NUM_CTX
 from core.progress import save_attempt
@@ -17,33 +17,42 @@ MAX_ATTEMPTS = 3           # LLM calls allowed to collect enough valid questions
 _QUIZZES: dict[str, dict] = {}   # quizzes waiting to be graded (in memory)
 
 EXAMPLE_JSON = (
-    '{"questions": [{"question": "...", "options": ["...", "...", "...", "..."], '
-    '"correct_index": 0, "explanation": "one short sentence", "page": 1}]}'
+    '{"questions": [{"question": "...", "correct_answer": "...", '
+    '"wrong_answers": ["...", "...", "..."], '
+    '"explanation": "one short sentence giving the reason", "page": 1}]}'
 )
 
 
 class QuizQuestion(BaseModel):
-    """One multiple-choice question; anything that doesn't fit this shape is dropped."""
+    """One question: the model gives the right answer as TEXT plus 3 wrong answers.
+    The code builds and shuffles the options itself, so a wrong index can't happen."""
     question: str
-    options: list[str]
-    correct_index: int
+    correct_answer: str
+    wrong_answers: list[str]
     explanation: str = ""
     page: int | None = None
 
-    @field_validator("options")
+    @field_validator("page", mode="before")
     @classmethod
-    def exactly_four_distinct(cls, v: list[str]) -> list[str]:
-        v = [str(o).strip() for o in v]
-        if len(v) != 4 or len(set(v)) != 4 or any(not o for o in v):
-            raise ValueError("need exactly 4 distinct, non-empty options")
-        return v
+    def lenient_page(cls, v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
 
-    @field_validator("correct_index")
-    @classmethod
-    def index_in_range(cls, v: int) -> int:
-        if not 0 <= v <= 3:
-            raise ValueError("correct_index must be 0-3")
-        return v
+    @model_validator(mode="after")
+    def check_answers(self) -> "QuizQuestion":
+        self.question = self.question.strip()
+        self.correct_answer = self.correct_answer.strip()
+        self.wrong_answers = [str(a).strip() for a in self.wrong_answers]
+        if not self.question or not self.correct_answer:
+            raise ValueError("question and correct_answer are required")
+        if len(self.wrong_answers) != 3 or any(not a for a in self.wrong_answers):
+            raise ValueError("need exactly 3 non-empty wrong answers")
+        options = [self.correct_answer] + self.wrong_answers
+        if len({o.lower() for o in options}) != 4:
+            raise ValueError("all 4 options must be different")
+        return self
 
 
 def get_chapter_chunks(subject: str, chapter: str) -> list[dict]:
@@ -78,15 +87,14 @@ def _parse_questions(raw: str) -> list[QuizQuestion]:
     return valid
 
 
-def _shuffle_options(q: QuizQuestion) -> dict:
-    """Small models love putting the answer first, so shuffle and re-find the index."""
-    correct_text = q.options[q.correct_index]
-    options = q.options[:]
+def _build_question(q: QuizQuestion) -> dict:
+    """Mix the right answer in with the wrong ones and record where it ended up."""
+    options = [q.correct_answer] + q.wrong_answers
     random.shuffle(options)
     return {
-        "question": q.question.strip(),
+        "question": q.question,
         "options": options,
-        "correct_index": options.index(correct_text),
+        "correct_index": options.index(q.correct_answer),
         "explanation": q.explanation.strip(),
         "page": q.page,
     }
@@ -117,8 +125,11 @@ def generate_quiz(subject: str, chapter: str, n: int = 5, class_level: str | Non
             f"Textbook excerpts:\n{excerpts}\n\n"
             f"Write {needed} multiple-choice questions based only on these excerpts.\n"
             f"Return JSON in exactly this shape:\n{EXAMPLE_JSON}\n"
-            "Rules: exactly 4 different options; correct_index is the position (0 to 3) of the "
-            "one right option; page is the page number shown in the excerpt."
+            "Rules: correct_answer is the one answer stated in the excerpts. "
+            "wrong_answers are exactly 3 believable but incorrect answers, all different from "
+            "correct_answer and from each other. All four options must be similar in length and "
+            "style, and short (under 12 words). explanation gives the reason in one sentence "
+            "and must not simply repeat the answer. page is the page number shown in the excerpt."
         )
         resp = ollama.chat(
             model=LLM_MODEL,
@@ -127,7 +138,7 @@ def generate_quiz(subject: str, chapter: str, n: int = 5, class_level: str | Non
             options={"temperature": 0.4, "num_ctx": LLM_NUM_CTX},
         )
         for q in _parse_questions(resp["message"]["content"]):
-            key = q.question.strip().lower()
+            key = q.question.lower()
             if key not in seen:
                 seen.add(key)
                 questions.append(q)
@@ -140,12 +151,24 @@ def generate_quiz(subject: str, chapter: str, n: int = 5, class_level: str | Non
         "quiz_id": quiz_id,
         "subject": subject,
         "chapter": chapter,
-        "questions": [_shuffle_options(q) for q in questions[:n]],
+        "questions": [_build_question(q) for q in questions[:n]],
     }
     _QUIZZES[quiz_id] = quiz
     if len(_QUIZZES) > 200:                    # don't grow forever
         _QUIZZES.pop(next(iter(_QUIZZES)))
     return quiz
+
+
+def _clean(text: str) -> str:
+    return text.strip().rstrip(".").strip()
+
+
+def _feedback(correct: bool, right_text: str, explanation: str) -> str:
+    # Skip the explanation if it only repeats the answer.
+    if explanation and _clean(explanation).lower() == _clean(right_text).lower():
+        explanation = ""
+    head = "Correct!" if correct else f"Not quite. The right answer is: {_clean(right_text)}."
+    return f"{head} {explanation}".strip()
 
 
 def grade(quiz_id: str, answers: list[int | None], student_id: int | None = None) -> dict:
@@ -161,13 +184,10 @@ def grade(quiz_id: str, answers: list[int | None], student_id: int | None = None
     for q, chosen in zip(questions, answers):
         correct = chosen == q["correct_index"]
         right_text = q["options"][q["correct_index"]]
-        if correct:
-            feedback = f"Correct! {q['explanation']}".strip()
-        else:
-            feedback = f"Not quite. The right answer is: {right_text}. {q['explanation']}".strip()
         results.append({
             "question": q["question"], "chosen": chosen, "correct_index": q["correct_index"],
-            "correct": correct, "feedback": feedback, "page": q["page"],
+            "correct": correct, "feedback": _feedback(correct, right_text, q["explanation"]),
+            "page": q["page"],
         })
 
     score = sum(r["correct"] for r in results)
@@ -186,7 +206,8 @@ if __name__ == "__main__":
 
     subject = input("Subject [Science]: ").strip() or "Science"
     chapter = input("Chapter [Crop Production and Management]: ").strip() or "Crop Production and Management"
-    n = int(input("How many questions [3]: ").strip() or 3)
+    raw_n = input("How many questions [3]: ").strip()
+    n = int(raw_n) if raw_n.isdigit() and int(raw_n) > 0 else 3
     name = input("Your name [Test Student]: ").strip() or "Test Student"
     student_id = get_or_create_student(name)
 
