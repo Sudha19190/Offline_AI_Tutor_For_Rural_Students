@@ -21,6 +21,10 @@ SQLITE_PATH = BASE_DIR / "app.db"
 # Default model in Ollama is phi3:latest (configurable via env var, e.g. qwen2.5:3b)
 LLM_MODEL = os.getenv("LLM_MODEL", "phi3:latest")
 
+# Context window sent to Ollama. A smaller value (2048) lets the model fit fully
+# in 4GB of GPU memory. Raise it only if you have more VRAM.
+LLM_NUM_CTX = int(os.getenv("LLM_NUM_CTX", "2048"))
+
 # Embedding model: BAAI/bge-m3 (1024-dim, multilingual, normalized, no query/passage prefixes)
 EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
 EMBED_DIM = 1024

@@ -5,7 +5,7 @@ from typing import Iterator
 
 import ollama
 
-from core.config import DEFAULT_CLASS_LEVEL, DEFAULT_LANGUAGE, LLM_MODEL, SCORE_THRESHOLD
+from core.config import DEFAULT_CLASS_LEVEL, DEFAULT_LANGUAGE, LLM_MODEL, SCORE_THRESHOLD, LLM_NUM_CTX 
 from core.retriever import retrieve
 
 NOT_FOUND = "I couldn't find this in your textbook. Please ask your teacher or try rephrasing."
@@ -16,14 +16,14 @@ def _build_messages(question: str, hits: list[dict], class_level: str, language:
     context = "\n\n".join(f"[Page {h['page']}] {h['text']}" for h in hits)
     system = (
         f"You are a friendly tutor for {class_level} students. "
-        "Answer ONLY using the textbook excerpts provided. "
-        "Use simple words and give one short example. "
+        "Answer using ONLY facts from the textbook excerpts provided. "
+        "Use simple words and keep the answer to 3-5 sentences. "
+        "If you give an example, it must come from the excerpts. Do not invent examples or facts. "
         f"Reply in {language}. "
         f"If the excerpts do not contain the answer, reply with exactly: {SENTINEL}"
     )
     user = f"Textbook excerpts:\n{context}\n\nQuestion: {question}"
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
-
 
 def _sources(hits: list[dict]) -> list[dict]:
     seen, out = set(), []
