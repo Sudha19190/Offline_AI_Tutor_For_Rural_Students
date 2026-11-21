@@ -6,6 +6,7 @@ keyword search (BM25 via rank_bm25) merged using Reciprocal Rank Fusion (RRF).
 
 import os
 import re
+import threading
 from typing import Any, Dict, List, Optional
 
 # Enforce offline mode for HuggingFace embedding model
@@ -27,7 +28,41 @@ from core.config import (
 # Global in-memory cache for BM25 and embedder
 _EMBEDDER: Optional[SentenceTransformer] = None
 _BM25_INDEX: Optional[BM25Okapi] = None
+_BM25_READY: bool = False
 _CORPUS_PAYLOADS: List[Dict[str, Any]] = []
+
+# Local Qdrant allows only one open client at a time. In the web app several requests can
+# arrive together, so each request holds this lock for as long as it has the database open.
+QDRANT_LOCK = threading.RLock()
+
+
+class _LockedClient(QdrantClient):
+    """QdrantClient that holds QDRANT_LOCK from the moment it is opened until close()."""
+
+    _holds_lock = False  # set to True only after the lock has been handed to this client
+
+    def close(self, *args, **kwargs):
+        try:
+            super().close(*args, **kwargs)
+        finally:
+            if self._holds_lock:
+                self._holds_lock = False
+                QDRANT_LOCK.release()
+
+
+def get_qdrant_client() -> QdrantClient:
+    """Opens the local on-disk database (waits if another request is using it).
+
+    Always call client.close() in a `finally` block, otherwise other requests wait forever.
+    """
+    QDRANT_LOCK.acquire()
+    try:
+        client = _LockedClient(path=str(QDRANT_PATH))
+    except BaseException:
+        QDRANT_LOCK.release()
+        raise
+    client._holds_lock = True
+    return client
 
 
 def get_embedder() -> SentenceTransformer:
@@ -44,22 +79,18 @@ def tokenize(text: str) -> List[str]:
     return re.findall(r"\w+", text.lower())
 
 
-def get_qdrant_client() -> QdrantClient:
-    """Returns an open QdrantClient connected to local on-disk database."""
-    return QdrantClient(path=str(QDRANT_PATH))
-
-
 def build_bm25_index() -> None:
     """
     Loads all chunk payloads from Qdrant and constructs the in-memory BM25 index.
     Called on startup and can be refreshed after new textbook ingestion.
     """
-    global _BM25_INDEX, _CORPUS_PAYLOADS
+    global _BM25_INDEX, _CORPUS_PAYLOADS, _BM25_READY
     client = get_qdrant_client()
     try:
         if not client.collection_exists(COLLECTION):
             _BM25_INDEX = None
             _CORPUS_PAYLOADS = []
+            _BM25_READY = True
             return
 
         points, _ = client.scroll(
@@ -87,13 +118,14 @@ def build_bm25_index() -> None:
             _BM25_INDEX = BM25Okapi(tokenized_corpus)
         else:
             _BM25_INDEX = None
+        _BM25_READY = True
     finally:
         client.close()
 
 
 def ensure_bm25_index() -> None:
-    """Ensures BM25 index is populated."""
-    if _BM25_INDEX is None:
+    """Ensures BM25 index has been built at least once."""
+    if not _BM25_READY:
         build_bm25_index()
 
 
@@ -252,6 +284,11 @@ def retrieve(
     Returns:
         List of dicts containing {text, page, chapter, subject, score}.
     """
+    # Build the BM25 index BEFORE opening the database below, so that code never
+    # tries to open Qdrant a second time while this request is already holding it.
+    if hybrid:
+        ensure_bm25_index()
+
     client = get_qdrant_client()
     try:
         embedder = get_embedder()
